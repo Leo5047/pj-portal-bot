@@ -87,7 +87,7 @@ def request_open_slots(session, cookie=None):
         "Referer": "https://www.pj-portal.de/index_uu.php?PAGE_ID=101",
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
     })
-    data = {"AJAX_ID": ENV_VAR["ajax_uid"]}
+    data = {"AJAX_ID": ENV_VAR["ajax_uid"], "TAB_ID": "Tab_Merkliste"}
     if cookie: # use preset cookie if available and try authentication 
         logging.info(f"Using preset cookie to {cookie} and not requesting a new one")
         session.cookies.set("PHPSESSID", cookie)
