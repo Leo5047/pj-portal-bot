@@ -1,15 +1,17 @@
-FROM python:3.12-slim
+FROM python:3.11-slim
 
 WORKDIR /usr/src/app
 
-# Pure-Python deps - no apt build tools needed
+ENV PIP_DEFAULT_TIMEOUT=120 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
+
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN python -m pip install --upgrade pip && \
+    pip install --retries 5 -r requirements.txt
 
 COPY pjportal.py .
 
-# Persist cookie + state + raw dumps across container restarts.
-# The actual storage backend is provided by the named volume in compose.
 RUN mkdir -p /data
 VOLUME ["/data"]
 
