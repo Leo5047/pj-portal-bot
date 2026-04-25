@@ -5,14 +5,16 @@ a notification to ntfy.
 
 Refactored fork of madrhr/pj-portal-bot:
 
-- Robust parser: substring-based CSS class matching instead of exact
-  whitespace comparisons (silent “0/0” fallback removed).
+- Pure-Python parser (BeautifulSoup + html.parser, no lxml/no C compile).
+- Substring-based CSS class matching (no silent “0/0” fallback when the
+  portal tweaks its class names).
 - Iterates the ENTIRE Merkliste and filters by `pj_tag` (default:
   “Innere Medizin”), so one container covers all hospitals you put on
-  your Merkliste on pj-portal.de.
-- State persistence in /data/state.json: push only on true transitions
+  your Merkliste at pj-portal.de.
+- State persistence in /data/state.json: pushes only on true transitions
   0 -> >0 per (hospital, term). No more spam while slots stay open.
 - One ntfy push per run, batching all new openings.
+- ntfy bearer-token auth via optional `ntfy_token` env.
 - Long-running: infinite loop with randomised sleep between checks.
 - Parse failures dump the raw HTML to /data/last_raw.html so you can
   fix the selector in minutes instead of guessing.
@@ -31,7 +33,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import requests
-from lxml import html
+from bs4 import BeautifulSoup
 
 # —————————————————————————
 
@@ -71,6 +73,7 @@ cfg = {
     "pwd": os.environ["pjportal_pwd"],
     "ajax_uid": os.environ["ajax_uid"],
     "ntfy_url_topic": os.environ["ntfy_url_topic"],
+    "ntfy_token": _env("ntfy_token"),
     "pj_tag": _env("pj_tag", "Innere Medizin"),
     "cookie_filepath": _env("cookie_filepath", "/data/cookie.txt"),
     "state_filepath": _env("state_filepath", "/data/state.json"),
@@ -82,7 +85,8 @@ cfg = {
 Path(cfg["state_filepath"]).parent.mkdir(parents=True, exist_ok=True)
 log.info(
     f"Watching pj_tag={cfg['pj_tag']!r}, "
-    f"interval={cfg['check_lower']}..{cfg['check_upper']}s"
+    f"interval={cfg['check_lower']}..{cfg['check_upper']}s, "
+    f"ntfy_auth={'token' if cfg['ntfy_token'] else 'none'}"
 )
 return cfg
 ```
@@ -194,26 +198,29 @@ SLOT_RE = re.compile(r”(\d+)\s*/\s*(\d+)”)
 
 Parsed = Dict[str, Dict[str, Dict[str, Tuple[int, int]]]]
 
-def _classes(el) -> str:
-return el.get(“class”) or “”
-
-def _texts(el) -> List[str]:
-return [t.strip() for t in el.itertext() if t and t.strip()]
+def _class_str(el) -> str:
+“”“Return the element’s class attribute as a single string for substring matching.”””
+cls = el.get(“class”)
+if cls is None:
+return “”
+if isinstance(cls, list):
+return “ “.join(cls)
+return str(cls)
 
 def parse_merkliste(htmltable: str) -> Parsed:
-tree = html.fromstring(htmltable)
+soup = BeautifulSoup(htmltable, “html.parser”)
 result: Parsed = {}
 current_fach: Optional[str] = None
 
 ```
-for row in tree.xpath("//tr"):
-    cls = _classes(row)
+for row in soup.find_all("tr"):
+    cls = _class_str(row)
 
     # Fach header row (e.g. "Innere Medizin")
     if "pj_info_fach" in cls:
-        texts = _texts(row)
+        texts = [t.strip() for t in row.stripped_strings if t.strip()]
         if texts:
-            # Fach name is usually the only non-empty text in the row
+            # Fach name is usually the only/longest non-empty text in the row
             current_fach = max(texts, key=len)
             result.setdefault(current_fach, {})
         continue
@@ -224,11 +231,11 @@ for row in tree.xpath("//tr"):
         terms: Dict[str, Tuple[int, int]] = {}
         term_idx = 0
 
-        for td in row.xpath("./td"):
-            td_cls = _classes(td)
+        for td in row.find_all("td", recursive=False):
+            td_cls = _class_str(td)
 
             if "bezeichnung_krankenhaus" in td_cls:
-                texts = _texts(td)
+                texts = [t.strip() for t in td.stripped_strings if t.strip()]
                 # Hospital name is usually the longest text in the cell
                 # (ignores single-character icons, short labels etc.)
                 hospital = max(texts, key=len) if texts else ""
@@ -236,7 +243,7 @@ for row in tree.xpath("//tr"):
             elif "tertial_verfuegbarkeit" in td_cls:
                 if term_idx >= len(TERMS):
                     continue
-                joined = " ".join(_texts(td))
+                joined = " ".join(td.stripped_strings)
                 m = SLOT_RE.search(joined)
                 terms[TERMS[term_idx]] = (
                     (int(m.group(1)), int(m.group(2))) if m else (0, 0)
@@ -306,24 +313,31 @@ for (h, t, free, total) in openings
 ]
 body = “\n”.join(lines)
 title = f”PJ-Portal: {len(openings)} freie Plätze ({cfg[‘pj_tag’]})”
+
+```
+headers = {
+    "Title": title,
+    "Priority": "high",
+    "Tags": "hospital",
+    "Click": cfg["ntfy_click_url"],
+}
+if cfg.get("ntfy_token"):
+    headers["Authorization"] = f"Bearer {cfg['ntfy_token']}"
+
 try:
-resp = requests.post(
-cfg[“ntfy_url_topic”],
-data=body.encode(“utf-8”),
-headers={
-“Title”: title,
-“Priority”: “high”,
-“Tags”: “hospital”,
-“Click”: cfg[“ntfy_click_url”],
-},
-timeout=15,
-)
-if resp.status_code >= 300:
-log.warning(f”ntfy push failed: {resp.status_code} {resp.text[:200]}”)
-else:
-log.info(f”Pushed {len(openings)} openings via ntfy”)
+    resp = requests.post(
+        cfg["ntfy_url_topic"],
+        data=body.encode("utf-8"),
+        headers=headers,
+        timeout=15,
+    )
+    if resp.status_code >= 300:
+        log.warning(f"ntfy push failed: {resp.status_code} {resp.text[:200]}")
+    else:
+        log.info(f"Pushed {len(openings)} openings via ntfy")
 except requests.RequestException as e:
-log.warning(f”ntfy unreachable: {e}”)
+    log.warning(f"ntfy unreachable: {e}")
+```
 
 # —————————————————————————
 
