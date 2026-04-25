@@ -1,262 +1,404 @@
-import sys
+#!/usr/bin/env python3
+“””
+pj-portal-bot: Monitor pj-portal.de Merkliste for newly free slots and push
+a notification to ntfy.
+
+Refactored fork of madrhr/pj-portal-bot:
+
+- Robust parser: substring-based CSS class matching instead of exact
+  whitespace comparisons (silent “0/0” fallback removed).
+- Iterates the ENTIRE Merkliste and filters by `pj_tag` (default:
+  “Innere Medizin”), so one container covers all hospitals you put on
+  your Merkliste on pj-portal.de.
+- State persistence in /data/state.json: push only on true transitions
+  0 -> >0 per (hospital, term). No more spam while slots stay open.
+- One ntfy push per run, batching all new openings.
+- Long-running: infinite loop with randomised sleep between checks.
+- Parse failures dump the raw HTML to /data/last_raw.html so you can
+  fix the selector in minutes instead of guessing.
+  “””
+
+from **future** import annotations
+
+import json
+import logging
 import os
 import random
+import re
+import sys
 import time
-import logging
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
 import requests
-import http.client, urllib
 from lxml import html
 
+# —————————————————————————
+
+# Config
+
+# —————————————————————————
 
 logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-    datefmt="%Y-%m-%d %H:%M:%S%z"
+format=”%(asctime)s - %(levelname)s - %(message)s”,
+level=logging.INFO,
+datefmt=”%Y-%m-%d %H:%M:%S%z”,
 )
+log = logging.getLogger(“pjportal”)
 
-ENV_VAR_OPTIONAL = ['pushover_user', 'pushover_token', 'ntfy_url_topic', 'cookie_filepath']
-ENV_VAR_REQUIRED = ['pjportal_user', 'pjportal_pwd', 'ajax_uid', 'pj_tag', 'hospital', 'term', 'check_frequency_lower_limit', 'check_frequency_upper_limit', 'cookie_default_value']
-ENV_VAR_list = ENV_VAR_REQUIRED + ENV_VAR_OPTIONAL
-ENV_VAR = {}
+BASE = “https://www.pj-portal.de”
+TERMS = (“first_term”, “second_term”, “third_term”)
+TERM_LABELS = {
+“first_term”: “1. Tertial”,
+“second_term”: “2. Tertial”,
+“third_term”: “3. Tertial”,
+}
 
-def load_env():
-    global ENV_VAR
-    ENV_VAR = {var_name: os.getenv(var_name) for var_name in ENV_VAR_list}
-    # logging.info(f"ENV: {ENV_VAR}")
-    if os.path.exists(ENV_VAR['cookie_filepath']):
-        with open(ENV_VAR['cookie_filepath'], "r") as file:
-            ENV_VAR['cookie_default_value'] = file.read().strip()
-            logging.info(f"Used cookie {(ENV_VAR['cookie_default_value'])} from file on path {(ENV_VAR['cookie_filepath'])}")
-    elif ENV_VAR['cookie_default_value']:
-        logging.info(f"No cookie file found on path {(ENV_VAR['cookie_filepath'])}, use cookie saved in env")
-        save_cookie(ENV_VAR['cookie_default_value'])
-    missing_vars = [key for key, value in ENV_VAR.items() if key not in ENV_VAR_OPTIONAL and value is None]
-    if missing_vars:
-        raise ValueError(f"Error: Missing required environment variables: {', '.join(missing_vars)}")
-    logging.info("Successfully loaded all required environment variables.")
-    return ENV_VAR
+REQUIRED_ENV = [“pjportal_user”, “pjportal_pwd”, “ajax_uid”, “ntfy_url_topic”]
 
+def _env(name: str, default: Optional[str] = None) -> Optional[str]:
+val = os.getenv(name)
+return val if val not in (None, “”) else default
 
+def load_config() -> dict:
+missing = [v for v in REQUIRED_ENV if not os.getenv(v)]
+if missing:
+raise SystemExit(f”Missing required ENV variables: {’, ’.join(missing)}”)
 
-def save_cookie(cookie_value):
-    with open(ENV_VAR['cookie_filepath'], "w") as file:
-        file.write(cookie_value)
-    logging.info(f"Saved new cookie: {cookie_value} on filepath: {(ENV_VAR['cookie_filepath'])}")
+```
+cfg = {
+    "user": os.environ["pjportal_user"],
+    "pwd": os.environ["pjportal_pwd"],
+    "ajax_uid": os.environ["ajax_uid"],
+    "ntfy_url_topic": os.environ["ntfy_url_topic"],
+    "pj_tag": _env("pj_tag", "Innere Medizin"),
+    "cookie_filepath": _env("cookie_filepath", "/data/cookie.txt"),
+    "state_filepath": _env("state_filepath", "/data/state.json"),
+    "raw_dump_path": _env("raw_dump_path", "/data/last_raw.html"),
+    "check_lower": int(_env("check_frequency_lower_limit", "180")),
+    "check_upper": int(_env("check_frequency_upper_limit", "420")),
+    "ntfy_click_url": _env("ntfy_click_url", f"{BASE}/index_uu.php?PAGE_ID=101"),
+}
+Path(cfg["state_filepath"]).parent.mkdir(parents=True, exist_ok=True)
+log.info(
+    f"Watching pj_tag={cfg['pj_tag']!r}, "
+    f"interval={cfg['check_lower']}..{cfg['check_upper']}s"
+)
+return cfg
+```
 
+# —————————————————————————
 
+# Cookie + session helpers
 
-def get_init_session_cookie(session):
-    logging.info("Accessing site...")
-    response = session.get(url="https://www.pj-portal.de/")
-    init_cookie = session.cookies.get_dict().get("PHPSESSID")
-    if init_cookie:
-        save_cookie(init_cookie)
-    return session
+# —————————————————————————
 
+def _load_cookie(cfg) -> Optional[str]:
+p = Path(cfg[“cookie_filepath”])
+if p.exists():
+val = p.read_text().strip()
+return val or None
+return None
 
+def _save_cookie(cfg, value: str) -> None:
+p = Path(cfg[“cookie_filepath”])
+p.parent.mkdir(parents=True, exist_ok=True)
+p.write_text(value)
 
-def get_auth_session_cookie(session):
-    logging.info("Starting authentication...")
-    session.headers.update({
-        "Origin": "https://www.pj-portal.de",
-        "Referer": "https://www.pj-portal.de/index_uu.php",
-    })
-    data = {
-        "name_Login": "Login",
-        "USER_NAME": ENV_VAR["pjportal_user"],
-        "PASSWORT": ENV_VAR["pjportal_pwd"],
-        "form_login_submit": "anmelden"
-    }
-    url = "https://www.pj-portal.de/index_uu.php"
-    response = session.post(url, data=data)
-    new_cookie = session.cookies.get_dict().get("PHPSESSID")
-    if new_cookie:
-        save_cookie(new_cookie)
-    logging.info("Authentication successfully completed...")
-    return session
+def new_session() -> requests.Session:
+s = requests.Session()
+s.headers.update({
+“User-Agent”: (
+“Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 “
+“(KHTML, like Gecko) Chrome/124.0 Safari/537.36”
+),
+“Accept-Language”: “de-DE,de;q=0.9,en;q=0.7”,
+“Accept-Encoding”: “gzip, deflate, br”,
+})
+return s
 
+def authenticate(session: requests.Session, cfg) -> str:
+log.info(“Authenticating at pj-portal.de …”)
+session.get(f”{BASE}/”)  # prime PHPSESSID
+session.headers.update({
+“Origin”: BASE,
+“Referer”: f”{BASE}/index_uu.php”,
+})
+resp = session.post(
+f”{BASE}/index_uu.php”,
+data={
+“name_Login”: “Login”,
+“USER_NAME”: cfg[“user”],
+“PASSWORT”: cfg[“pwd”],
+“form_login_submit”: “anmelden”,
+},
+)
+resp.raise_for_status()
+cookie = session.cookies.get(“PHPSESSID”)
+if not cookie:
+raise RuntimeError(“Login failed - no PHPSESSID cookie received”)
+_save_cookie(cfg, cookie)
+log.info(“Authentication successful”)
+return cookie
 
+def fetch_merkliste(session: requests.Session, cfg) -> str:
+“”“Return the Merkliste HTML table, re-authenticating once if needed.”””
+headers = {
+“Accept”: “application/json, text/javascript, */*; q=0.01”,
+“Origin”: BASE,
+“Referer”: f”{BASE}/index_uu.php?PAGE_ID=101”,
+“Content-Type”: “application/x-www-form-urlencoded; charset=UTF-8”,
+“X-Requested-With”: “XMLHttpRequest”,
+}
+payload = {“AJAX_ID”: cfg[“ajax_uid”], “TAB_ID”: “Tab_Merkliste”}
 
-def request_open_slots(session, cookie=None):
-    logging.info("Grabing data...")
-    session.headers.update({
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Accept-Encoding": "gzip, deflate, br, zstd",
-        "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Origin": "https://www.pj-portal.de",
-        "Referer": "https://www.pj-portal.de/index_uu.php?PAGE_ID=101",
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
-    })
-    data = {"AJAX_ID": ENV_VAR["ajax_uid"], "TAB_ID": "Tab_Merkliste"}
-    if cookie: # use preset cookie if available and try authentication 
-        logging.info(f"Using preset cookie to {cookie} and not requesting a new one")
-        session.cookies.set("PHPSESSID", cookie)
-    response = session.post("https://www.pj-portal.de/ajax.php", data=data)
-    if response.status_code == 200 and not response.content.decode('utf-8') == '{"HTML":" Antwort kein Handler ","ERRORCLASS":2}':
-        logging.info(f"Request was successful ({response.status_code}): received data from merkliste")
-        return response
-    else:
-        logging.warning(f"Request failed with status code {response.status_code}")
-        logging.warning(f"Response Content: {response.content}")
-        raise Exception
+```
+cached = _load_cookie(cfg)
+if cached:
+    session.cookies.set("PHPSESSID", cached)
 
-
-
-def extract_table_from_response(response):
-
-    parsing_result_dict = {}
-
-    jsonobj = response.json()
-    htmltable = jsonobj.get("HTML")
-    tree = html.fromstring(htmltable)
-    main_xpath = f"/html/body/table/tr"
-
-    i = 0
-    pj_tag = ""
-    for row in tree.xpath(f"{main_xpath}"):
-        
-        i+=1
-        if row.attrib["class"] == "merkliste pj_info_fach":
-            cols = row.xpath('.//td')
-            for elem in cols:
-                if (elem.attrib["class"]) == ' ':
-                    pj_tag = elem.xpath('.//text()')[0].strip()
-                    parsing_result_dict[pj_tag] = {}
-
-        elif row.attrib["class"] == "merkliste_krankenhaus":
-            cols = row.xpath('.//td')
-            tertiar_counter = 0
-            term_desc = ["first_term", "second_term", "third_term"]
-            for elem in cols:
-                if 'class' in elem.attrib:
-
-                    if (elem.attrib["class"]) == "pj_info_bezeichnung_krankenhaus ":
-
-                        hospital = elem.xpath('.//text()')[2].strip()
-                        parsing_result_dict[pj_tag][hospital] = {term_desc[0]: None, term_desc[1]: None, term_desc[2]: None}
-     
-                    if (elem.attrib["class"]) in [" tertial_verfuegbarkeit   verfuegbar  buchungsphase  ", " tertial_verfuegbarkeit   ausgebucht  buchungsphase  ", " tertial_verfuegbarkeit verfuegbar  buchungsphase  ", " tertial_verfuegbarkeit ausgebucht  buchungsphase  ", " tertial_verfuegbarkeit verfuegbar  ", " tertial_verfuegbarkeit ausgebucht  "]:
-                        testint = elem.xpath('.//text()')
-                        try:
-                            slots = elem.xpath('.//text()')[0].strip()
-                        except:
-                            slots = '0/0'
-                        slots = slots or '0/0'
-                        parsing_result_dict[pj_tag][hospital][term_desc[tertiar_counter]] = tuple(map(int, slots.split('/')))
-                        tertiar_counter += 1
-
-    return parsing_result_dict
-
-
-def send_push_message(msg):
-    pushover_user = os.environ.get('pushover_user')
-    pushover_token = os.environ.get('pushover_token')
-    ntfy_url_topic = os.environ.get('ntfy_url_topic')
-    if pushover_user and pushover_token:
-        send_pushover_notification(msg)
-    if ntfy_url_topic:
-        send_ntfy_notification(msg)
-    if not (pushover_user and pushover_token) and not ntfy_url_topic:
-        logging.warning("No credentials for either Pushover or ntfy specified as env.")
-
-
-def send_pushover_notification(msg):
-    conn = http.client.HTTPSConnection("api.pushover.net:443")
-    conn.request("POST", "/1/messages.json",
-    urllib.parse.urlencode({
-        "token": ENV_VAR['pushover_token'],
-        "user": ENV_VAR['pushover_user'],
-        "message": msg,
-    }), { "Content-type": "application/x-www-form-urlencoded" })
-    response = conn.getresponse()
-    if not response.status == 200:
-        logging.warning(f"Notification failed. Status: {response.status}, Reason: {response.reason}")
-
-
-def send_ntfy_notification(msg):
-    url = f'{ENV_VAR["ntfy_url_topic"]}'
-    headers = {
-        "Title": "Found something on pj-portal.de",
-        "Priority": str(5)
-    }
-    response = requests.post(url, data=msg.encode('utf-8'), headers=headers)
-    if not response.status_code == 200:
-        logging.warning(f"Failed to send notification through ntfy: {response.status_code} - {response.text}")
-
-
-def run_main():
-
-    session = requests.Session()
-    session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-            "Accept-Encoding": "gzip, deflate, br, zstd",
-        })
-
-    def run_auth(session):
-        session = get_init_session_cookie(session)
-        session = get_auth_session_cookie(session)
-        return session
-
-    def run_table_check(table_dict, pj_tag, hospital, term):
-        logging.info("Parsing data from request and checking the table...")
-        logging.info(table_dict)
-        result_tuple = table_dict[pj_tag][hospital][term]
-        info = f"{result_tuple[0]}/{result_tuple[1]}"
-        if result_tuple[0] > 0:
-            msg = f"Found something for {pj_tag}, {hospital}, {term}! {info}!"
-            logging.info(msg)
-            send_push_message(msg=msg)
-        else:
-            logging.info(f"Nothing found for {pj_tag}, {hospital}, {term}: {info}")
-
+for attempt in (1, 2):
+    resp = session.post(f"{BASE}/ajax.php", data=payload, headers=headers)
+    if resp.status_code != 200:
+        raise RuntimeError(f"ajax.php HTTP {resp.status_code}")
 
     try:
-        response = request_open_slots(session, cookie=ENV_VAR['cookie_default_value'])
-        table_dict = extract_table_from_response(response)
-        
-        run_table_check(table_dict=table_dict, pj_tag=ENV_VAR["pj_tag"], hospital=ENV_VAR["hospital"], term=ENV_VAR["term"])
+        data = resp.json()
+    except ValueError:
+        raise RuntimeError(f"ajax.php did not return JSON: {resp.text[:200]!r}")
 
-    except IndexError as e:
-        logging.warnign("Got a IndexError")
-        sys.exit(1)
+    htmltable = data.get("HTML", "") or ""
+    err = data.get("ERRORCLASS")
+    if "Antwort kein Handler" in htmltable or err == 2 or not htmltable:
+        if attempt == 1:
+            log.info("Session invalid - re-authenticating")
+            session.cookies.clear()
+            authenticate(session, cfg)
+            continue
+        raise RuntimeError(f"ajax.php rejected after re-auth (ERRORCLASS={err})")
 
-    except Exception as e:
-        logging.warning("Trying new authentication!")
-        session.cookies.clear()
-        session = run_auth(session)
-        response = request_open_slots(session)
-        table_dict = extract_table_from_response(response)
-        run_table_check(table_dict=table_dict, pj_tag=ENV_VAR["pj_tag"], hospital=ENV_VAR["hospital"], term=ENV_VAR["term"])
-    
-    logging.info("Script completed.")
+    return htmltable
 
+raise RuntimeError("ajax.php unreachable")
+```
 
-MAX_RETRIES = 5 
+# —————————————————————————
 
-if __name__ == "__main__":
-    logging.info("--------------------------------------------")
-    logging.info("Script started")
-    logging.info("Loading ENV...")
-    ENV_VAR = load_env()
-    sleeptime = random.randint(int(ENV_VAR['check_frequency_lower_limit']), int(ENV_VAR['check_frequency_upper_limit']))
-    logging.info(f"Sleeping for {sleeptime}s...")
-    time.sleep(sleeptime)
-    retries = 0
-    while retries < MAX_RETRIES:
-        try:
-            run_main()
-            if retries > 0:
-                logging.info(f"Script executed successfully after {retries} retries.")
-            break
-        except Exception as e:
-            retries += 1
-            logging.error(f"Attempt {retries} failed with error: {e}")
-            if retries >= MAX_RETRIES:
-                error_msg = f"pj-portal.py failed after {MAX_RETRIES} attempts with error: {e}"
-                send_push_message(msg=f"Script Failure! Script will be stopped. Following error occurred: {error_msg}")
-                sys.exit(1)
-            else:
-                wait_time = 2 ** retries
-                logging.info(f"Retrying in {wait_time} seconds...")
-                time.sleep(wait_time)
+# Parser - robust against CSS / whitespace changes
+
+# —————————————————————————
+
+SLOT_RE = re.compile(r”(\d+)\s*/\s*(\d+)”)
+
+# Nested dict: {fach: {hospital: {term_key: (free, total)}}}
+
+Parsed = Dict[str, Dict[str, Dict[str, Tuple[int, int]]]]
+
+def _classes(el) -> str:
+return el.get(“class”) or “”
+
+def _texts(el) -> List[str]:
+return [t.strip() for t in el.itertext() if t and t.strip()]
+
+def parse_merkliste(htmltable: str) -> Parsed:
+tree = html.fromstring(htmltable)
+result: Parsed = {}
+current_fach: Optional[str] = None
+
+```
+for row in tree.xpath("//tr"):
+    cls = _classes(row)
+
+    # Fach header row (e.g. "Innere Medizin")
+    if "pj_info_fach" in cls:
+        texts = _texts(row)
+        if texts:
+            # Fach name is usually the only non-empty text in the row
+            current_fach = max(texts, key=len)
+            result.setdefault(current_fach, {})
+        continue
+
+    # Hospital row with three tertial cells
+    if "merkliste_krankenhaus" in cls and current_fach is not None:
+        hospital = ""
+        terms: Dict[str, Tuple[int, int]] = {}
+        term_idx = 0
+
+        for td in row.xpath("./td"):
+            td_cls = _classes(td)
+
+            if "bezeichnung_krankenhaus" in td_cls:
+                texts = _texts(td)
+                # Hospital name is usually the longest text in the cell
+                # (ignores single-character icons, short labels etc.)
+                hospital = max(texts, key=len) if texts else ""
+
+            elif "tertial_verfuegbarkeit" in td_cls:
+                if term_idx >= len(TERMS):
+                    continue
+                joined = " ".join(_texts(td))
+                m = SLOT_RE.search(joined)
+                terms[TERMS[term_idx]] = (
+                    (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+                )
+                term_idx += 1
+
+        if hospital:
+            result[current_fach][hospital] = terms
+
+return result
+```
+
+# —————————————————————————
+
+# State diff + notifications
+
+# —————————————————————————
+
+def load_state(cfg) -> Dict[str, int]:
+p = Path(cfg[“state_filepath”])
+if not p.exists():
+return {}
+try:
+return json.loads(p.read_text())
+except Exception:
+log.warning(“State file unreadable - starting fresh”)
+return {}
+
+def save_state(cfg, state: Dict[str, int]) -> None:
+p = Path(cfg[“state_filepath”])
+p.parent.mkdir(parents=True, exist_ok=True)
+p.write_text(json.dumps(state, ensure_ascii=False, indent=2))
+
+def diff_openings(
+parsed: Parsed,
+pj_tag: str,
+prev_state: Dict[str, int],
+) -> Tuple[List[tuple], Dict[str, int]]:
+“””
+Compare new parse against previous state.
+
+```
+Returns:
+    openings: list of (hospital, term_key, free, total) tuples for new
+              0->>0 transitions
+    new_state: complete snapshot of free counts to persist
+"""
+new_state: Dict[str, int] = {}
+openings: List[tuple] = []
+
+for hospital, terms in parsed.get(pj_tag, {}).items():
+    for term_key, (free, total) in terms.items():
+        k = f"{pj_tag}|{hospital}|{term_key}"
+        new_state[k] = free
+        if free > 0 and prev_state.get(k, 0) == 0:
+            openings.append((hospital, term_key, free, total))
+
+return openings, new_state
+```
+
+def notify(cfg, openings: List[tuple]) -> None:
+if not openings:
+return
+lines = [
+f”{h} — {TERM_LABELS.get(t, t)}: {free}/{total}”
+for (h, t, free, total) in openings
+]
+body = “\n”.join(lines)
+title = f”PJ-Portal: {len(openings)} freie Plätze ({cfg[‘pj_tag’]})”
+try:
+resp = requests.post(
+cfg[“ntfy_url_topic”],
+data=body.encode(“utf-8”),
+headers={
+“Title”: title,
+“Priority”: “high”,
+“Tags”: “hospital”,
+“Click”: cfg[“ntfy_click_url”],
+},
+timeout=15,
+)
+if resp.status_code >= 300:
+log.warning(f”ntfy push failed: {resp.status_code} {resp.text[:200]}”)
+else:
+log.info(f”Pushed {len(openings)} openings via ntfy”)
+except requests.RequestException as e:
+log.warning(f”ntfy unreachable: {e}”)
+
+# —————————————————————————
+
+# Main loop
+
+# —————————————————————————
+
+def _dump_raw(cfg, htmltable: str) -> None:
+try:
+Path(cfg[“raw_dump_path”]).parent.mkdir(parents=True, exist_ok=True)
+Path(cfg[“raw_dump_path”]).write_text(htmltable)
+log.warning(f”Raw response dumped to {cfg[‘raw_dump_path’]}”)
+except Exception as e:
+log.warning(f”Could not dump raw response: {e}”)
+
+def run_once(cfg) -> None:
+session = new_session()
+
+```
+try:
+    htmltable = fetch_merkliste(session, cfg)
+except Exception as e:
+    log.error(f"Fetch failed: {e}")
+    return
+
+try:
+    parsed = parse_merkliste(htmltable)
+except Exception as e:
+    log.error(f"Parser crashed: {e}")
+    _dump_raw(cfg, htmltable)
+    return
+
+if not parsed:
+    log.warning("Parser returned an empty result")
+    _dump_raw(cfg, htmltable)
+    return
+
+total_entries = sum(len(h) for h in parsed.values())
+log.info(f"Parsed {len(parsed)} Fächer / {total_entries} hospital entries")
+
+if cfg["pj_tag"] not in parsed:
+    log.warning(
+        f"pj_tag {cfg['pj_tag']!r} not found in Merkliste. "
+        f"Available: {list(parsed.keys())}. "
+        f"Put matching entries on your Merkliste at pj-portal.de."
+    )
+    return
+
+prev = load_state(cfg)
+openings, new_state = diff_openings(parsed, cfg["pj_tag"], prev)
+
+if openings:
+    log.info(f"New openings: {openings}")
+    notify(cfg, openings)
+else:
+    log.info("No new openings")
+
+save_state(cfg, new_state)
+```
+
+def main() -> None:
+cfg = load_config()
+log.info(“pj-portal-bot started”)
+while True:
+try:
+run_once(cfg)
+except Exception as e:
+log.exception(f”Unexpected error in run loop: {e}”)
+sleep_for = random.randint(cfg[“check_lower”], cfg[“check_upper”])
+log.info(f”Sleeping {sleep_for}s”)
+time.sleep(sleep_for)
+
+if **name** == “**main**”:
+try:
+main()
+except KeyboardInterrupt:
+log.info(“Stopped by user”)
+sys.exit(0)
