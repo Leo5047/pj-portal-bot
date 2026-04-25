@@ -1,2 +1,2 @@
-requests
-lxml
+requests>=2.31,<3
+lxml>=5.0,<6
