@@ -1,0 +1,22 @@
+services:
+  pjportalbot:
+    build: .
+    # Or, once you push your own image:
+    # image: ghcr.io/<your-user>/pj-portal-bot:latest
+    container_name: pjportalbot
+    restart: unless-stopped
+    environment:
+      # --- Required ---
+      pjportal_user: "${PJPORTAL_USER}"
+      pjportal_pwd:  "${PJPORTAL_PWD}"
+      ajax_uid:      "${AJAX_UID}"
+      ntfy_url_topic: "${NTFY_URL_TOPIC}"   # e.g. https://ntfy.example.com/pj-portal
+
+      # --- Optional, sensible defaults ---
+      pj_tag: "Innere Medizin"
+      check_frequency_lower_limit: "180"    # seconds
+      check_frequency_upper_limit: "420"
+      # ntfy_click_url: "https://www.pj-portal.de/index_uu.php?PAGE_ID=101"
+
+    volumes:
+      - ./data:/data
