@@ -236,6 +236,20 @@ def parse_merkliste(htmltable: str) -> Parsed:
     for row in soup.find_all("tr"):
         cls = _class_str(row)
 
+        # ----- Fach header row: <tr class="merkliste pj_info_fach"> -----
+        # Must be checked BEFORE the hospital branch because some pages have
+        # both classes' substrings appearing nearby.
+        if "pj_info_fach" in cls:
+            # Row has a few empty <td>s plus one with the fach name.
+            # Take the first non-empty cell text as the fach.
+            for td in row.find_all("td", recursive=False):
+                text = td.get_text(strip=True)
+                if text and 2 <= len(text) <= 80:
+                    current_fach = text
+                    result.setdefault(current_fach, {})
+                    break
+            continue
+
         # ----- Hospital row with three tertial cells -----
         if "merkliste_krankenhaus" in cls:
             if current_fach is None:
@@ -269,20 +283,6 @@ def parse_merkliste(htmltable: str) -> Parsed:
 
             if hospital:
                 result[current_fach][hospital] = terms
-            continue
-
-        # ----- Fach header row -----
-        # On the merkliste page, fach headers are <tr> elements with a single
-        # <td colspan="12"> containing just the fach name. They have no
-        # distinguishing class, so we detect them structurally.
-        tds = row.find_all("td", recursive=False)
-        if len(tds) == 1:
-            td = tds[0]
-            if td.get("colspan"):
-                text = td.get_text(strip=True)
-                if text and 2 <= len(text) <= 80:
-                    current_fach = text
-                    result.setdefault(current_fach, {})
 
     return result
 
