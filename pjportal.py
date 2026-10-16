@@ -9,7 +9,8 @@ Refactored fork of madrhr/pj-portal-bot:
     hidden fields, form action) instead of hardcoding them, and verifies that
     the login really succeeded.
   - Pure-Python parser (BeautifulSoup + html.parser), robust against the
-    portal's invalid HTML.
+    portal's invalid HTML; understands both the old table layout and the
+    new one introduced in autumn 2026.
   - Scans the whole Merkliste and filters by `pj_tag` (default:
     "Innere Medizin").
   - State in /data/state.json: pushes only on real 0 -> >0 transitions per
@@ -354,19 +355,44 @@ def _class_str(el) -> str:
     return str(cls)
 
 
+# Row/cell markers for both table layouts the portal has used:
+#   old (until summer 2026)      new (since autumn 2026)
+#   tr.pj_info_fach              tr.pj_angebot_fach
+#   tr.merkliste_krankenhaus     tr.pj_angebot_krankenhaus_fach_info
+#   td.pj_info_bezeichnung_...   td.pj_angebot_krankenhaus_fach
+#   td.tertial_verfuegbarkeit    td.tertial_angebot_verfuegbarkeit
+# Closed tertials are td.tertial_verfuegbarkeit_beendet in both layouts.
+FACH_ROW_MARKERS = ("pj_info_fach", "pj_angebot_fach")
+HOSPITAL_ROW_MARKERS = ("merkliste_krankenhaus", "krankenhaus_fach_info")
+NAME_CELL_MARKERS = ("bezeichnung_krankenhaus", "krankenhaus_fach")
+
+
+def _has(cls: str, markers) -> bool:
+    return any(m in cls for m in markers)
+
+
 def _extract_hospital_name(td) -> str:
     """
-    The hospital cell looks like:
+    New layout:
+        <td class="pj_angebot_krankenhaus_fach">
+          <p class="pj_angebot_bezeichnung_universitaet">Berlin Charité</p>
+          <p class="pj_angebot_bezeichnung_Krankenhaus">Berlin Vivantes Humboldt</p>
+        </td>
+    Old layout:
         <td class="pj_info_bezeichnung_krankenhaus">
           <span class="infobox_inhalt_kurz">
-            Berlin Charité<br>Berlin Bundeswehrkrankenhaus
-            <span class="infobox_inhalt_lang">
-              Charité - Universitätsmedizin Berlin<br>...
-            </span>
+            Berlin Charité<br>Berlin Vivantes Humboldt
+            <span class="infobox_inhalt_lang">tooltip text</span>
           </span>
         </td>
-    We want the visible short label, with the long-form tooltip removed.
+    Both give "Berlin Charité / Berlin Vivantes Humboldt", so state keys stay stable.
     """
+    parts = [" ".join(p.get_text(" ", strip=True).split())
+             for p in td.find_all("p", class_=re.compile(r"bezeichnung", re.I))]
+    parts = [x for x in parts if x]
+    if parts:
+        return " / ".join(parts)
+
     short = td.find(class_="infobox_inhalt_kurz")
     if short is None:
         return td.get_text(separator=" / ", strip=True)
@@ -384,8 +410,8 @@ def parse_merkliste(htmltable: str) -> Parsed:
     for row in soup.find_all("tr"):
         cls = _class_str(row)
 
-        # ----- Fach header row: <tr class="merkliste pj_info_fach"> -----
-        if "pj_info_fach" in cls:
+        # ----- Fach header row -----
+        if _has(cls, FACH_ROW_MARKERS):
             # Row has a few empty <td>s plus one with the fach name.
             for td in row.find_all("td", recursive=False):
                 text = td.get_text(strip=True)
@@ -396,7 +422,7 @@ def parse_merkliste(htmltable: str) -> Parsed:
             continue
 
         # ----- Hospital row with three tertial cells -----
-        if "merkliste_krankenhaus" in cls:
+        if _has(cls, HOSPITAL_ROW_MARKERS):
             if current_fach is None:
                 continue
 
@@ -412,13 +438,15 @@ def parse_merkliste(htmltable: str) -> Parsed:
             for td in row.find_all("td"):
                 td_cls = _class_str(td)
 
-                if "pj_info_bezeichnung_krankenhaus" in td_cls:
+                if _has(td_cls, NAME_CELL_MARKERS):
                     hospital = _extract_hospital_name(td)
 
-                elif "tertial_verfuegbarkeit" in td_cls:
+                elif "verfuegbarkeit" in td_cls:
+                    # One cell per tertial: "..._beendet" (closed) or the
+                    # availability cell showing "free / total".
                     if term_idx >= len(TERMS):
                         continue
-                    if "_beendet" in td_cls:
+                    if "beendet" in td_cls:
                         terms[TERMS[term_idx]] = (0, 0)
                     else:
                         joined = " ".join(td.stripped_strings)
