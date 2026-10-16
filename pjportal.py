@@ -1,27 +1,31 @@
 #!/usr/bin/env python3
 """
-pj-portal-bot: Monitor pj-portal.de Merkliste for newly free slots and push
-a notification to ntfy.
+pj-portal-bot: Monitor the pj-portal.de Merkliste for newly free slots and
+push a notification to ntfy.
 
 Refactored fork of madrhr/pj-portal-bot:
 
-  - Pure-Python parser (BeautifulSoup + html.parser, no lxml/no C compile).
-  - Substring-based CSS class matching (no silent "0/0" fallback when the
-    portal tweaks its class names).
-  - Iterates the ENTIRE Merkliste and filters by `pj_tag` (default:
-    "Innere Medizin"), so one container covers all hospitals you put on
-    your Merkliste at pj-portal.de.
-  - State persistence in /data/state.json: pushes only on true transitions
-    0 -> >0 per (hospital, term). No more spam while slots stay open.
-  - One ntfy push per run, batching all new openings.
-  - ntfy bearer-token auth via optional `ntfy_token` env.
-  - Long-running: infinite loop with randomised sleep between checks.
-  - Parse failures dump the raw HTML to /data/last_raw.html so you can
-    fix the selector in minutes instead of guessing.
+  - Login reads the login form from the portal on every login (field names,
+    hidden fields, form action) instead of hardcoding them, and verifies that
+    the login really succeeded.
+  - Pure-Python parser (BeautifulSoup + html.parser), robust against the
+    portal's invalid HTML.
+  - Scans the whole Merkliste and filters by `pj_tag` (default:
+    "Innere Medizin").
+  - State in /data/state.json: pushes only on real 0 -> >0 transitions per
+    (hospital, tertial). If a push fails, the state is not saved, so the
+    opening is pushed again on the next run.
+  - Failure alerts: after `alert_after_failures` failed runs in a row, one
+    ntfy warning (repeated daily while the problem persists) and a recovery
+    message afterwards. Failed runs back off so the portal is not hammered.
+  - Optional heartbeat URL (e.g. an Uptime Kuma push monitor).
+  - `python pjportal.py --check` runs one diagnostic pass without touching
+    the state or sending pushes; `--test-push` sends a test notification.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -31,6 +35,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urljoin, urlsplit
 
 import requests
 from bs4 import BeautifulSoup
@@ -47,6 +52,10 @@ logging.basicConfig(
 log = logging.getLogger("pjportal")
 
 BASE = "https://www.pj-portal.de"
+HTTP_TIMEOUT = 30
+ALERT_REPEAT_S = 24 * 3600
+MAX_SLEEP_S = 3600
+
 TERMS = ("first_term", "second_term", "third_term")
 TERM_LABELS = {
     "first_term": "1. Tertial",
@@ -57,15 +66,27 @@ TERM_LABELS = {
 REQUIRED_ENV = ["pjportal_user", "pjportal_pwd", "ajax_uid", "ntfy_url_topic"]
 
 
+class BotError(Exception):
+    """A failed run with a human-readable reason (used for logs and alerts)."""
+
+
 def _env(name: str, default: Optional[str] = None) -> Optional[str]:
     val = os.getenv(name)
     return val if val not in (None, "") else default
 
 
+def _short(text, limit: int = 150) -> str:
+    return " ".join(str(text).split())[:limit]
+
+
+def _merkliste_page() -> str:
+    return f"{BASE}/index_uu.php?PAGE_ID=101"
+
+
 def load_config() -> dict:
     missing = [v for v in REQUIRED_ENV if not os.getenv(v)]
     if missing:
-        raise SystemExit(f"Missing required ENV variables: {', '.join(missing)}")
+        raise SystemExit(f"Fehlende ENV-Variablen: {', '.join(missing)}")
 
     cfg = {
         "user": os.environ["pjportal_user"],
@@ -79,19 +100,23 @@ def load_config() -> dict:
         "raw_dump_path": _env("raw_dump_path", "/data/last_raw.html"),
         "check_lower": int(_env("check_frequency_lower_limit", "180")),
         "check_upper": int(_env("check_frequency_upper_limit", "420")),
-        "ntfy_click_url": _env("ntfy_click_url", f"{BASE}/index_uu.php?PAGE_ID=101"),
+        "ntfy_click_url": _env("ntfy_click_url", _merkliste_page()),
+        "alert_after": max(1, int(_env("alert_after_failures", "3"))),
+        "heartbeat_url": _env("heartbeat_url"),
     }
     Path(cfg["state_filepath"]).parent.mkdir(parents=True, exist_ok=True)
     log.info(
-        f"Watching pj_tag={cfg['pj_tag']!r}, "
-        f"interval={cfg['check_lower']}..{cfg['check_upper']}s, "
-        f"ntfy_auth={'token' if cfg['ntfy_token'] else 'none'}"
+        f"Überwache pj_tag={cfg['pj_tag']!r}, "
+        f"Intervall={cfg['check_lower']}..{cfg['check_upper']}s, "
+        f"ntfy_auth={'token' if cfg['ntfy_token'] else 'none'}, "
+        f"Warnung nach {cfg['alert_after']} Fehlversuchen, "
+        f"Heartbeat={'an' if cfg['heartbeat_url'] else 'aus'}"
     )
     return cfg
 
 
 # ---------------------------------------------------------------------------
-# Cookie + session helpers
+# Session + login
 # ---------------------------------------------------------------------------
 
 def _load_cookie(cfg) -> Optional[str]:
@@ -108,6 +133,21 @@ def _save_cookie(cfg, value: str) -> None:
     p.write_text(value)
 
 
+def _clear_cookie(cfg) -> None:
+    try:
+        Path(cfg["cookie_filepath"]).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _session_cookie(session: requests.Session) -> Optional[str]:
+    value = None
+    for c in session.cookies:
+        if c.name == "PHPSESSID":
+            value = c.value
+    return value
+
+
 def new_session() -> requests.Session:
     s = requests.Session()
     s.headers.update({
@@ -116,74 +156,182 @@ def new_session() -> requests.Session:
             "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
         ),
         "Accept-Language": "de-DE,de;q=0.9,en;q=0.7",
-        "Accept-Encoding": "gzip, deflate, br",
     })
     return s
 
 
-def authenticate(session: requests.Session, cfg) -> str:
-    log.info("Authenticating at pj-portal.de ...")
-    session.get(f"{BASE}/")  # prime PHPSESSID
-    session.headers.update({
-        "Origin": BASE,
-        "Referer": f"{BASE}/index_uu.php",
-    })
+def _password_input(soup):
+    return (
+        soup.find("input", attrs={"type": re.compile(r"^password$", re.I)})
+        or soup.find("input", attrs={"name": re.compile(r"^passwort$", re.I)})
+    )
+
+
+def _page_message(soup) -> str:
+    """Best-effort: the error/notice text the portal shows next to the form."""
+    for el in soup.find_all(class_=re.compile(r"fehler|error|warn|meldung", re.I)):
+        text = _short(el.get_text(" ", strip=True), 200)
+        if len(text) >= 3:
+            return text
+    return ""
+
+
+def _find_login_form(session: requests.Session):
+    """
+    Load a portal page that contains the login form.
+    Returns (page_url, container) where container is the <form> element, or
+    the whole page if the portal's broken HTML hides the form boundaries.
+    """
+    for url in (f"{BASE}/index_uu.php", f"{BASE}/"):
+        resp = session.get(url, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        pw = _password_input(soup)
+        if pw is not None:
+            form = pw.find_parent("form")
+            return resp.url, (form if form is not None else soup)
+    raise BotError("Login-Formular nicht gefunden – hat sich die Portal-Seite geändert?")
+
+
+def _build_login_payload(container, user: str, pwd: str) -> Tuple[Dict[str, str], List[str]]:
+    """
+    Mirror what a browser sends when submitting the login form: all named
+    fields with their (hidden) default values, the first submit button,
+    plus our username and password.
+    """
+    data: Dict[str, str] = {}
+    names: List[str] = []
+    user_field: Optional[str] = None
+    pw_field: Optional[str] = None
+    submit_added = False
+
+    for el in container.find_all(["input", "button"]):
+        name = el.get("name")
+        if not name:
+            continue
+        names.append(name)
+        default_type = "submit" if el.name == "button" else "text"
+        typ = (el.get("type") or default_type).lower()
+
+        if typ == "password" or name.lower() == "passwort":
+            pw_field = name
+        elif typ == "submit":
+            if not submit_added:
+                data[name] = el.get("value", "")
+                submit_added = True
+        elif typ in ("image", "button", "reset", "file"):
+            continue
+        elif typ in ("checkbox", "radio"):
+            if el.has_attr("checked"):
+                data[name] = el.get("value", "on")
+        else:
+            if typ in ("text", "email") and user_field is None:
+                user_field = name
+            data[name] = el.get("value", "")
+
+    if "USER_NAME" in names:
+        user_field = "USER_NAME"
+    if pw_field is None or user_field is None:
+        raise BotError(f"Login-Formular unvollständig erkannt (Felder: {names})")
+
+    data[user_field] = user
+    data[pw_field] = pwd
+    return data, names
+
+
+def authenticate(session: requests.Session, cfg) -> None:
+    log.info("Login bei pj-portal.de ...")
+    session.cookies.clear()
+    page_url, container = _find_login_form(session)
+    data, names = _build_login_payload(container, cfg["user"], cfg["pwd"])
+
+    action = container.get("action") if container.name == "form" else None
+    if action:
+        post_url = urljoin(page_url, action)
+    elif container.name == "form":
+        post_url = page_url
+    else:
+        post_url = f"{BASE}/index_uu.php"
+
     resp = session.post(
-        f"{BASE}/index_uu.php",
-        data={
-            "name_Login": "Login",
-            "USER_NAME": cfg["user"],
-            "PASSWORT": cfg["pwd"],
-            "form_login_submit": "anmelden",
-        },
+        post_url,
+        data=data,
+        headers={"Origin": BASE, "Referer": page_url},
+        timeout=HTTP_TIMEOUT,
     )
     resp.raise_for_status()
-    cookie = session.cookies.get("PHPSESSID")
-    if not cookie:
-        raise RuntimeError("Login failed - no PHPSESSID cookie received")
-    _save_cookie(cfg, cookie)
-    log.info("Authentication successful")
-    return cookie
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    logged_in = "abmelden" in resp.text.lower() or _password_input(soup) is None
+    if not logged_in:
+        _clear_cookie(cfg)
+        hint = _page_message(soup)
+        raise BotError(
+            "Login fehlgeschlagen – das Portal zeigt wieder das Login-Formular"
+            + (f" („{hint}“)" if hint else "")
+            + f". Formularfelder: {names}. Zugangsdaten prüfen."
+        )
+
+    cookie = _session_cookie(session)
+    if cookie:
+        _save_cookie(cfg, cookie)
+    log.info("Login OK")
+
+
+# ---------------------------------------------------------------------------
+# Merkliste
+# ---------------------------------------------------------------------------
+
+def _ajax_merkliste(session: requests.Session, cfg) -> Tuple[Optional[str], str]:
+    """One ajax.php call. Returns (html, problem); html is None if refused."""
+    resp = session.post(
+        f"{BASE}/ajax.php",
+        data={"AJAX_ID": cfg["ajax_uid"]},
+        headers={
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Origin": BASE,
+            "Referer": _merkliste_page(),
+            "X-Requested-With": "XMLHttpRequest",
+        },
+        timeout=HTTP_TIMEOUT,
+    )
+    if resp.status_code != 200:
+        return None, f"ajax.php HTTP {resp.status_code}"
+    try:
+        data = resp.json()
+    except ValueError:
+        return None, f"ajax.php lieferte kein JSON: {_short(resp.text)}"
+
+    html = data.get("HTML") or ""
+    err = data.get("ERRORCLASS")
+    if str(err) not in ("0", "None") or not html.strip() or "kein Handler" in html:
+        return None, (
+            f"ERRORCLASS={err}, AJAX_ID={data.get('AJAX_ID')}, "
+            f"HTML={_short(html, 80)!r}"
+        )
+    return html, ""
 
 
 def fetch_merkliste(session: requests.Session, cfg) -> str:
-    """Return the Merkliste HTML table, re-authenticating once if needed."""
-    headers = {
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Origin": BASE,
-        "Referer": f"{BASE}/index_uu.php?PAGE_ID=101",
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-        "X-Requested-With": "XMLHttpRequest",
-    }
-    payload = {"AJAX_ID": cfg["ajax_uid"], "TAB_ID": "Tab_Merkliste"}
-
+    """Return the Merkliste HTML, logging in again if the cached session is stale."""
     cached = _load_cookie(cfg)
     if cached:
-        session.cookies.set("PHPSESSID", cached)
+        session.cookies.set("PHPSESSID", cached, domain=urlsplit(BASE).hostname)
+        html, problem = _ajax_merkliste(session, cfg)
+        if html is not None:
+            return html
+        log.info(f"Gespeicherte Sitzung ungültig ({problem}) – neuer Login")
+        _clear_cookie(cfg)
 
-    for attempt in (1, 2):
-        resp = session.post(f"{BASE}/ajax.php", data=payload, headers=headers)
-        if resp.status_code != 200:
-            raise RuntimeError(f"ajax.php HTTP {resp.status_code}")
-
-        try:
-            data = resp.json()
-        except ValueError:
-            raise RuntimeError(f"ajax.php did not return JSON: {resp.text[:200]!r}")
-
-        htmltable = data.get("HTML", "") or ""
-        err = data.get("ERRORCLASS")
-        if "Antwort kein Handler" in htmltable or err == 2 or not htmltable:
-            if attempt == 1:
-                log.info("Session invalid - re-authenticating")
-                session.cookies.clear()
-                authenticate(session, cfg)
-                continue
-            raise RuntimeError(f"ajax.php rejected after re-auth (ERRORCLASS={err})")
-
-        return htmltable
-
-    raise RuntimeError("ajax.php unreachable")
+    authenticate(session, cfg)
+    html, problem = _ajax_merkliste(session, cfg)
+    if html is None:
+        raise BotError(
+            f"Login OK, aber die Merkliste wird abgelehnt ({problem}). "
+            f"Vermutlich hat sich die AJAX_ID geändert – "
+            f"'python pjportal.py --check' zeigt Kandidaten."
+        )
+    return html
 
 
 # ---------------------------------------------------------------------------
@@ -237,11 +385,8 @@ def parse_merkliste(htmltable: str) -> Parsed:
         cls = _class_str(row)
 
         # ----- Fach header row: <tr class="merkliste pj_info_fach"> -----
-        # Must be checked BEFORE the hospital branch because some pages have
-        # both classes' substrings appearing nearby.
         if "pj_info_fach" in cls:
             # Row has a few empty <td>s plus one with the fach name.
-            # Take the first non-empty cell text as the fach.
             for td in row.find_all("td", recursive=False):
                 text = td.get_text(strip=True)
                 if text and 2 <= len(text) <= 80:
@@ -253,7 +398,6 @@ def parse_merkliste(htmltable: str) -> Parsed:
         # ----- Hospital row with three tertial cells -----
         if "merkliste_krankenhaus" in cls:
             if current_fach is None:
-                # hospital encountered before any fach header - skip
                 continue
 
             hospital = ""
@@ -272,8 +416,6 @@ def parse_merkliste(htmltable: str) -> Parsed:
                     hospital = _extract_hospital_name(td)
 
                 elif "tertial_verfuegbarkeit" in td_cls:
-                    # One such cell per tertial; either the "_beendet" variant
-                    # (closed phase, no slots) or the regular cell with "X / Y".
                     if term_idx >= len(TERMS):
                         continue
                     if "_beendet" in td_cls:
@@ -293,7 +435,7 @@ def parse_merkliste(htmltable: str) -> Parsed:
 
 
 # ---------------------------------------------------------------------------
-# State diff + notifications
+# State diff
 # ---------------------------------------------------------------------------
 
 def load_state(cfg) -> Dict[str, int]:
@@ -303,7 +445,7 @@ def load_state(cfg) -> Dict[str, int]:
     try:
         return json.loads(p.read_text())
     except Exception:
-        log.warning("State file unreadable - starting fresh")
+        log.warning("State-Datei unlesbar – starte neu")
         return {}
 
 
@@ -319,11 +461,10 @@ def diff_openings(
     prev_state: Dict[str, int],
 ) -> Tuple[List[tuple], Dict[str, int]]:
     """
-    Compare new parse against previous state.
+    Compare a new parse against the previous state.
 
     Returns:
-        openings: list of (hospital, term_key, free, total) tuples for new
-                  0->>0 transitions
+        openings: (hospital, term_key, free, total) for each new 0 -> >0 transition
         new_state: complete snapshot of free counts to persist
     """
     new_state: Dict[str, int] = {}
@@ -339,113 +480,265 @@ def diff_openings(
     return openings, new_state
 
 
-def notify(cfg, openings: List[tuple]) -> None:
-    if not openings:
-        return
+# ---------------------------------------------------------------------------
+# Notifications
+# ---------------------------------------------------------------------------
+
+def _header_value(text: str) -> str:
+    """HTTP headers are ASCII; ntfy decodes RFC 2047 for everything else."""
+    try:
+        text.encode("ascii")
+        return text
+    except UnicodeEncodeError:
+        return "=?UTF-8?B?" + base64.b64encode(text.encode("utf-8")).decode("ascii") + "?="
+
+
+def send_ntfy(cfg, title: str, message: str, priority: str = "default",
+              tags: str = "", click: Optional[str] = None) -> bool:
+    headers = {"Title": _header_value(title), "Priority": priority}
+    if tags:
+        headers["Tags"] = tags
+    if click:
+        headers["Click"] = click
+    if cfg.get("ntfy_token"):
+        headers["Authorization"] = f"Bearer {cfg['ntfy_token']}"
+    try:
+        resp = requests.post(
+            cfg["ntfy_url_topic"],
+            data=message.encode("utf-8"),
+            headers=headers,
+            timeout=15,
+        )
+    except requests.RequestException as e:
+        log.warning(f"ntfy nicht erreichbar: {e}")
+        return False
+    if resp.status_code >= 300:
+        log.warning(f"ntfy-Push fehlgeschlagen: {resp.status_code} {_short(resp.text, 200)}")
+        return False
+    return True
+
+
+def notify_openings(cfg, openings: List[tuple]) -> bool:
     lines = [
         f"{h} — {TERM_LABELS.get(t, t)}: {free}/{total}"
         for (h, t, free, total) in openings
     ]
-    body = "\n".join(lines)
-    title = f"PJ-Portal: {len(openings)} freie Plätze ({cfg['pj_tag']})"
+    if len(openings) == 1:
+        title = f"PJ-Portal: neuer freier Platz ({cfg['pj_tag']})"
+    else:
+        title = f"PJ-Portal: {len(openings)} neue freie Plätze ({cfg['pj_tag']})"
+    ok = send_ntfy(cfg, title, "\n".join(lines), priority="high",
+                   tags="hospital", click=cfg["ntfy_click_url"])
+    if ok:
+        log.info(f"{len(openings)} neue freie Plätze per ntfy gemeldet")
+    return ok
 
-    headers = {
-        "Title": title,
-        "Priority": "high",
-        "Tags": "hospital",
-        "Click": cfg["ntfy_click_url"],
-    }
-    if cfg.get("ntfy_token"):
-        headers["Authorization"] = f"Bearer {cfg['ntfy_token']}"
 
+def heartbeat(cfg, ok: bool, msg: str) -> None:
+    """Optional push monitor (e.g. Uptime Kuma): up after good runs, down after failed ones."""
+    url = cfg.get("heartbeat_url")
+    if not url:
+        return
     try:
-        resp = requests.post(
-            cfg["ntfy_url_topic"],
-            data=body.encode("utf-8"),
-            headers=headers,
-            timeout=15,
+        requests.get(
+            url.split("?", 1)[0],
+            params={"status": "up" if ok else "down", "msg": _short(msg, 200), "ping": ""},
+            timeout=10,
         )
-        if resp.status_code >= 300:
-            log.warning(f"ntfy push failed: {resp.status_code} {resp.text[:200]}")
-        else:
-            log.info(f"Pushed {len(openings)} openings via ntfy")
     except requests.RequestException as e:
-        log.warning(f"ntfy unreachable: {e}")
+        log.warning(f"Heartbeat nicht erreichbar: {e}")
 
 
 # ---------------------------------------------------------------------------
-# Main loop
+# One run
 # ---------------------------------------------------------------------------
 
 def _dump_raw(cfg, htmltable: str) -> None:
     try:
         Path(cfg["raw_dump_path"]).parent.mkdir(parents=True, exist_ok=True)
         Path(cfg["raw_dump_path"]).write_text(htmltable)
-        log.warning(f"Raw response dumped to {cfg['raw_dump_path']}")
+        log.warning(f"Rohdaten gespeichert in {cfg['raw_dump_path']}")
     except Exception as e:
-        log.warning(f"Could not dump raw response: {e}")
+        log.warning(f"Rohdaten konnten nicht gespeichert werden: {e}")
 
 
-def run_once(cfg) -> None:
+def _free_lines(parsed: Parsed, pj_tag: str) -> List[str]:
+    return [
+        f"{h} — {TERM_LABELS.get(t, t)}: {free}/{total}"
+        for h, terms in parsed.get(pj_tag, {}).items()
+        for t, (free, total) in terms.items()
+        if free > 0
+    ]
+
+
+def run_once(cfg) -> str:
+    """One check. Returns a status line; raises on failure."""
     session = new_session()
-
-    try:
-        htmltable = fetch_merkliste(session, cfg)
-    except Exception as e:
-        log.error(f"Fetch failed: {e}")
-        return
+    htmltable = fetch_merkliste(session, cfg)
 
     try:
         parsed = parse_merkliste(htmltable)
     except Exception as e:
-        log.error(f"Parser crashed: {e}")
         _dump_raw(cfg, htmltable)
-        return
+        raise BotError(f"Parser-Fehler: {e!r}")
 
     if not parsed:
-        log.warning("Parser returned an empty result")
         _dump_raw(cfg, htmltable)
-        return
-
-    total_entries = sum(len(h) for h in parsed.values())
-    log.info(f"Parsed {len(parsed)} Fächer / {total_entries} hospital entries")
-
+        raise BotError("Merkliste geladen, aber nichts erkannt – Seitenaufbau geändert? "
+                       f"Rohdaten in {cfg['raw_dump_path']}")
     if cfg["pj_tag"] not in parsed:
-        log.warning(
-            f"pj_tag {cfg['pj_tag']!r} not found in Merkliste. "
-            f"Available: {list(parsed.keys())}. "
-            f"Put matching entries on your Merkliste at pj-portal.de."
-        )
-        return
+        raise BotError(f"Fach {cfg['pj_tag']!r} nicht in der Merkliste "
+                       f"(gefunden: {', '.join(parsed)})")
 
     prev = load_state(cfg)
     openings, new_state = diff_openings(parsed, cfg["pj_tag"], prev)
 
     if openings:
-        log.info(f"New openings: {openings}")
-        notify(cfg, openings)
-    else:
-        log.info("No new openings")
+        log.info(f"Neue freie Plätze: {openings}")
+        if not notify_openings(cfg, openings):
+            # Keep the old state so these openings are pushed again next run.
+            raise BotError("Neue freie Plätze gefunden, aber der ntfy-Push ist fehlgeschlagen")
 
     save_state(cfg, new_state)
+    return (
+        f"{cfg['pj_tag']}: {len(parsed[cfg['pj_tag']])} Kliniken, "
+        f"{len(_free_lines(parsed, cfg['pj_tag']))} Tertiale mit freien Plätzen, "
+        f"davon neu: {len(openings)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Main loop with failure tracking
+# ---------------------------------------------------------------------------
+
+class Health:
+    def __init__(self) -> None:
+        self.failures = 0
+        self.first_failure = 0.0
+        self.last_alert = 0.0
+
+
+def _reason(e: Exception) -> str:
+    if isinstance(e, BotError):
+        return str(e)
+    if isinstance(e, requests.RequestException):
+        return _short(f"HTTP-/Netzwerkfehler: {e}", 300)
+    return _short(f"Unerwarteter Fehler: {e!r}", 300)
+
+
+def _ago(ts: float) -> str:
+    mins = max(1, int((time.time() - ts) / 60))
+    return f"{mins} Min." if mins < 120 else f"{mins // 60} Std."
+
+
+def tick(cfg, health: Health) -> int:
+    """Run one check, handle alerts, return the number of seconds to sleep."""
+    base_sleep = random.randint(cfg["check_lower"], cfg["check_upper"])
+    try:
+        status = run_once(cfg)
+    except Exception as e:
+        reason = _reason(e)
+        health.failures += 1
+        if health.failures == 1:
+            health.first_failure = time.time()
+        if isinstance(e, (BotError, requests.RequestException)):
+            log.error(f"Lauf fehlgeschlagen ({health.failures}x in Folge): {reason}")
+        else:
+            log.exception(f"Lauf fehlgeschlagen ({health.failures}x in Folge): {reason}")
+        heartbeat(cfg, False, reason)
+
+        if (health.failures >= cfg["alert_after"]
+                and time.time() - health.last_alert >= ALERT_REPEAT_S):
+            body = (f"{reason}\n\n{health.failures} Fehlversuche in Folge "
+                    f"seit {_ago(health.first_failure)}\n"
+                    f"Details: docker logs pjportalbot")
+            if send_ntfy(cfg, "PJ-Bot gestört", body, priority="high", tags="warning"):
+                health.last_alert = time.time()
+                log.info("Störungsmeldung per ntfy verschickt")
+
+        # Back off on repeated failures so the portal is not hammered.
+        factor = 2 ** min(health.failures - 1, 3)
+        return min(base_sleep * factor, MAX_SLEEP_S)
+
+    log.info(status)
+    if health.last_alert:
+        send_ntfy(cfg, "PJ-Bot läuft wieder",
+                  f"Nach {health.failures} Fehlversuchen klappt die Abfrage wieder.\n{status}",
+                  priority="low", tags="white_check_mark")
+    health.failures, health.first_failure, health.last_alert = 0, 0.0, 0.0
+    heartbeat(cfg, True, status)
+    return base_sleep
 
 
 def main() -> None:
     cfg = load_config()
-    log.info("pj-portal-bot started")
+    log.info("pj-portal-bot gestartet")
+    health = Health()
     while True:
-        try:
-            run_once(cfg)
-        except Exception as e:
-            log.exception(f"Unexpected error in run loop: {e}")
-        sleep_for = random.randint(cfg["check_lower"], cfg["check_upper"])
-        log.info(f"Sleeping {sleep_for}s")
+        sleep_for = tick(cfg, health)
+        log.info(f"Nächster Lauf in {sleep_for}s")
         time.sleep(sleep_for)
 
 
+# ---------------------------------------------------------------------------
+# Diagnostics:  python pjportal.py --check [--test-push]
+# ---------------------------------------------------------------------------
+
+def check(cfg, test_push: bool) -> int:
+    rc = 0
+    print("== Login ==")
+    session = new_session()
+    try:
+        page_url, container = _find_login_form(new_session())
+        fields, _ = _build_login_payload(container, "<benutzer>", "<passwort>")
+        action = container.get("action") if container.name == "form" else None
+        print(f"Formular auf {page_url}, action={action!r}")
+        print(f"Gesendete Felder: {fields}")
+        authenticate(session, cfg)
+        print("OK")
+        page = session.get(_merkliste_page(), timeout=HTTP_TIMEOUT).text
+        ids = sorted(set(re.findall(r"ajax_?id\W{0,6}(\d{4,9})", page, re.I)))
+        print(f"AJAX_ID konfiguriert: {cfg['ajax_uid']} | auf der Seite gefunden: {ids or '-'}")
+
+        print("== Merkliste ==")
+        html, problem = _ajax_merkliste(session, cfg)
+        if html is None:
+            print(f"FEHLER: {problem}")
+            rc = 1
+        else:
+            parsed = parse_merkliste(html)
+            for fach, hospitals in parsed.items():
+                print(f"{fach}: {len(hospitals)} Kliniken")
+            if cfg["pj_tag"] not in parsed:
+                print(f"FEHLER: Fach {cfg['pj_tag']!r} nicht gefunden")
+                rc = 1
+            else:
+                print(f"== Aktuell freie Plätze ({cfg['pj_tag']}) ==")
+                for line in _free_lines(parsed, cfg["pj_tag"]) or ["keine"]:
+                    print(f"  {line}")
+    except Exception as e:
+        print(f"FEHLER: {_reason(e)}")
+        rc = 1
+
+    if test_push:
+        ok = send_ntfy(cfg, "PJ-Bot Test: Plätze & Umlaute ✓",
+                       "Testnachricht von pjportal.py --check", tags="test_tube")
+        print(f"== Test-Push: {'OK' if ok else 'FEHLER'} ==")
+        rc = rc or (0 if ok else 1)
+    return rc
+
+
 if __name__ == "__main__":
+    args = set(sys.argv[1:])
+    if args & {"--check", "--test-push"}:
+        cfg = load_config()
+        if "--check" in args:
+            sys.exit(check(cfg, "--test-push" in args))
+        ok = send_ntfy(cfg, "PJ-Bot Test: Plätze & Umlaute ✓", "Testnachricht von pjportal.py")
+        print("Test-Push:", "OK" if ok else "FEHLER")
+        sys.exit(0 if ok else 1)
     try:
         main()
     except KeyboardInterrupt:
-        log.info("Stopped by user")
+        log.info("Beendet")
         sys.exit(0)
